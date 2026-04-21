@@ -48,4 +48,5 @@ runs/
 *.cache
 *.engine
 *.onnx
-*.torchscript
+*.torchscript# Agentic development
+.venv-libreyolo/
