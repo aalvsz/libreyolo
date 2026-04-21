@@ -49,3 +49,5 @@ runs/
 *.engine
 *.onnx
 *.torchscript
+# Agentic development
+.venv-libreyolo/
