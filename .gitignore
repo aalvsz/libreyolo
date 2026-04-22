@@ -49,3 +49,6 @@ runs/
 *.engine
 *.onnx
 *.torchscript
+# Agentic development
+.venv-tracking/
+.venv-yoloworld/
