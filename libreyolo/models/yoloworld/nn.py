@@ -1,172 +1,515 @@
-"""LibreYOLOWorld — open-vocabulary YOLO architecture.
+"""LibreYOLOWorld — open-vocabulary YOLO architecture (real).
 
-Text-prompted detection: given an image and a list of class names as text,
-detect those classes zero-shot. Architecture shape:
+Text-prompted detection with a YOLOv8-CSPDarknet backbone, a frozen CLIP text
+encoder, a RepVL-PAN neck (MaxSigmoidCSPLayerWithTwoConv fusion), and a
+BNContrastiveHead classifier. Structurally compatible with the Tencent/
+YOLO-World-V2.1 release — a separate state-dict remapper (see
+`weight_porting.py`) loads their `.pth` checkpoints into this module.
 
-    image ──► vision encoder (YOLOv9 backbone) ──► spatial features
-                                                       │
-                                                       ▼
-    texts ──► CLIP text encoder ──► text_embeds ──► similarity head ──► boxes + class logits
+License note: the official YOLO-World weights (`wondervictor/YOLO-World-V2.1`
+on HF) are **GPL-3.0**. LibreYOLO itself is MIT, so we never bundle weights.
+Users who opt in to the GPL weights at runtime are bound by GPL for their
+downstream code — document this clearly in the README.
 
-This is a **scaffold** with a working forward pass and smoke-tested API.
-Weight porting from Tencent/YOLO-World (https://github.com/AILab-CVC/YOLO-World)
-is future work — the architecture below uses the existing LibreYOLO9 backbone
-plus a lightweight CLIP-driven classification head. Real open-vocab accuracy
-requires the RepVL-PAN neck and proper weight porting.
-
-See `docs/agentic-features/blog/yolo-world-integration.md` for scope.
+Architectural reference: https://github.com/AILab-CVC/YOLO-World (`yolo_world/`).
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+import math
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Embedding dimension used internally to align vision and text features.
-# Projections on both sides map to this space.
-EMBED_DIM = 512
+# CLIP ViT-B/32 text embedding dimension (what YOLO-World-V2.1 uses by default).
+CLIP_EMBED_DIM = 512
+
+# YOLOv8 scaling factors per size. (deepen, widen, last_stage_out_channels).
+# Channel counts per stage (P3/P4/P5) = (256 * widen, 512 * widen, last_stage_out * widen).
+YOLO8_SCALES = {
+    "s": (0.33, 0.50, 1024),
+    "m": (0.67, 0.75, 768),
+    "l": (1.00, 1.00, 512),
+    "x": (1.00, 1.25, 512),
+}
+
+
+# ---------------------------------------------------------------------------
+# Basic building blocks — match mmyolo / Ultralytics YOLOv8 for weight portability.
+# ---------------------------------------------------------------------------
+
+
+def _autopad(k: int, p: Optional[int] = None) -> int:
+    return k // 2 if p is None else p
+
+
+class ConvModule(nn.Module):
+    """Conv -> BN -> SiLU, with sub-module names `conv`/`bn` matching mmyolo's ConvModule."""
+
+    def __init__(self, c1: int, c2: int, k: int = 1, s: int = 1, p: Optional[int] = None,
+                 g: int = 1, act: bool = True):
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, _autopad(k, p), groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class DarknetBottleneck(nn.Module):
+    """Standard YOLOv8 bottleneck (2x ConvModule, optional residual)."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 0.5,
+                 k: Tuple[int, int] = (3, 3)):
+        super().__init__()
+        c_ = int(c2 * e)
+        self.conv1 = ConvModule(c1, c_, k[0], 1)
+        self.conv2 = ConvModule(c_, c2, k[1], 1, g=1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.conv2(self.conv1(x)) if self.add else self.conv2(self.conv1(x))
+
+
+class CSPLayerWithTwoConv(nn.Module):
+    """YOLOv8 C2f block — mmyolo's name for this: `CSPLayerWithTwoConv`.
+
+    Split-in-half cross-stage with N bottleneck blocks, concat-then-fuse.
+    Sub-module names chosen to match mmyolo state dicts:
+        main_conv, final_conv, blocks.{0..n-1}
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, e: float = 0.5):
+        super().__init__()
+        self.mid_channels = int(c2 * e)
+        self.main_conv = ConvModule(c1, 2 * self.mid_channels, 1, 1)
+        self.final_conv = ConvModule((2 + n) * self.mid_channels, c2, 1, 1)
+        self.blocks = nn.ModuleList(
+            DarknetBottleneck(self.mid_channels, self.mid_channels, shortcut=shortcut, e=1.0,
+                              k=(3, 3))
+            for _ in range(n)
+        )
+
+    def forward(self, x):
+        y = self.main_conv(x)
+        y1, y2 = y.split(self.mid_channels, dim=1)
+        outs = [y1, y2]
+        for blk in self.blocks:
+            outs.append(blk(outs[-1]))
+        return self.final_conv(torch.cat(outs, dim=1))
+
+
+class SPPFBottleneck(nn.Module):
+    """YOLOv8 SPPF: three chained maxpools, concat with input, 1x1 fuse."""
+
+    def __init__(self, c1: int, c2: int, k: int = 5):
+        super().__init__()
+        c_ = c1 // 2
+        self.conv1 = ConvModule(c1, c_, 1, 1)
+        self.conv2 = ConvModule(c_ * 4, c2, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        y1 = self.m(x)
+        y2 = self.m(y1)
+        y3 = self.m(y2)
+        return self.conv2(torch.cat([x, y1, y2, y3], dim=1))
+
+
+# ---------------------------------------------------------------------------
+# Backbone — YOLOv8CSPDarknet.
+# ---------------------------------------------------------------------------
+
+
+def _make_divisible(x: float, divisor: int = 8) -> int:
+    return max(divisor, int(x + divisor / 2) // divisor * divisor)
+
+
+class YOLOv8CSPDarknet(nn.Module):
+    """YOLOv8 CSP-Darknet backbone. Outputs P3 / P4 / P5 feature maps.
+
+    Layer naming chosen to match mmyolo's `YOLOv8CSPDarknet` so state_dict
+    keys remap cleanly.
+    """
+
+    def __init__(self, size: str = "l"):
+        super().__init__()
+        if size not in YOLO8_SCALES:
+            raise ValueError(f"unknown size {size!r}; supported: {list(YOLO8_SCALES)}")
+        deepen, widen, last_out = YOLO8_SCALES[size]
+
+        self.size = size
+        self.widen = widen
+        self.deepen = deepen
+
+        # Stage channel counts (P3/P4/P5)
+        ch_p3 = _make_divisible(256 * widen)
+        ch_p4 = _make_divisible(512 * widen)
+        ch_p5 = _make_divisible(last_out * widen)
+
+        # Depths (C2f num_blocks) per stage — YOLOv8: [3, 6, 6, 3] scaled by deepen
+        d1 = max(1, round(3 * deepen))
+        d2 = max(1, round(6 * deepen))
+        d3 = max(1, round(6 * deepen))
+        d4 = max(1, round(3 * deepen))
+
+        ch_stem = _make_divisible(64 * widen)
+        ch_s1 = _make_divisible(128 * widen)
+
+        self.stem = ConvModule(3, ch_stem, k=3, s=2)
+
+        # stage{i} = Sequential(down_conv, C2f)
+        self.stage1 = nn.Sequential(
+            ConvModule(ch_stem, ch_s1, k=3, s=2),
+            CSPLayerWithTwoConv(ch_s1, ch_s1, n=d1, shortcut=True),
+        )
+        self.stage2 = nn.Sequential(
+            ConvModule(ch_s1, ch_p3, k=3, s=2),
+            CSPLayerWithTwoConv(ch_p3, ch_p3, n=d2, shortcut=True),
+        )
+        self.stage3 = nn.Sequential(
+            ConvModule(ch_p3, ch_p4, k=3, s=2),
+            CSPLayerWithTwoConv(ch_p4, ch_p4, n=d3, shortcut=True),
+        )
+        self.stage4 = nn.Sequential(
+            ConvModule(ch_p4, ch_p5, k=3, s=2),
+            CSPLayerWithTwoConv(ch_p5, ch_p5, n=d4, shortcut=True),
+            SPPFBottleneck(ch_p5, ch_p5, k=5),
+        )
+
+        self.out_channels = (ch_p3, ch_p4, ch_p5)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = self.stem(x)
+        x = self.stage1(x)
+        p3 = self.stage2(x)
+        p4 = self.stage3(p3)
+        p5 = self.stage4(p4)
+        return p3, p4, p5
+
+
+# ---------------------------------------------------------------------------
+# CLIP text encoder (frozen).
+# ---------------------------------------------------------------------------
 
 
 class TextEncoder(nn.Module):
-    """Lightweight text encoder wrapping HuggingFace CLIP text model.
+    """Frozen HuggingFace CLIP text encoder with a projection head.
 
-    We use CLIP because its text embeddings are already aligned to open-vocab
-    visual features (that's literally what CLIP is trained for). YOLO-World's
-    paper uses a CLIP ViT-B/32 text tower by default — we do the same.
+    Matches YOLO-World-V2.1's `HuggingCLIPLanguageBackbone` (frozen, using
+    the `CLIPTextModelWithProjection` variant with `text_projection.weight`).
+    Outputs L2-normalized 512-D text embeddings.
     """
 
     _HF_MODEL = "openai/clip-vit-base-patch32"
 
-    def __init__(self, embed_dim: int = EMBED_DIM):
+    def __init__(self, embed_dim: int = CLIP_EMBED_DIM):
         super().__init__()
-        # Import lazily so the model is importable without transformers installed.
-        from transformers import CLIPTextModel, CLIPTokenizer
+        from transformers import CLIPTextModelWithProjection, CLIPTokenizer
 
         self.tokenizer = CLIPTokenizer.from_pretrained(self._HF_MODEL)
-        self.text_model = CLIPTextModel.from_pretrained(self._HF_MODEL)
-
-        # Freeze text encoder (standard in open-vocab detection — we don't
-        # fine-tune CLIP during YOLO-World training either).
+        self.text_model = CLIPTextModelWithProjection.from_pretrained(self._HF_MODEL)
         for p in self.text_model.parameters():
             p.requires_grad_(False)
         self.text_model.eval()
 
-        clip_dim = self.text_model.config.hidden_size  # 512 for ViT-B/32
-        self.proj = (
-            nn.Identity() if clip_dim == embed_dim else nn.Linear(clip_dim, embed_dim, bias=False)
-        )
+        proj_dim = self.text_model.config.projection_dim
+        self.proj = nn.Identity() if proj_dim == embed_dim else nn.Linear(proj_dim, embed_dim, bias=False)
 
     @torch.no_grad()
-    def encode(self, prompts: List[str], device: torch.device | None = None) -> torch.Tensor:
-        """Return (N_prompts, EMBED_DIM) L2-normalized text embeddings."""
+    def encode(self, prompts: Sequence[str], device: Optional[torch.device] = None) -> torch.Tensor:
         if device is None:
             device = next(self.text_model.parameters()).device
-        tokens = self.tokenizer(prompts, padding=True, return_tensors="pt").to(device)
+        tokens = self.tokenizer(list(prompts), padding=True, return_tensors="pt").to(device)
         out = self.text_model(**tokens)
-        # pooler_output is CLIP's [EOS] embedding — standard for text classification.
-        x = out.pooler_output
-        x = self.proj(x)
+        # CLIPTextModelWithProjection returns a ModelOutput with .text_embeds (already projected).
+        x = self.proj(out.text_embeds)
         return F.normalize(x, dim=-1)
 
 
-class VisionEncoder(nn.Module):
-    """Minimal CNN backbone producing spatial features.
+# ---------------------------------------------------------------------------
+# RepVL-PAN fusion — the core YOLO-World innovation.
+# ---------------------------------------------------------------------------
 
-    For the MVP we use a small custom backbone rather than reusing LibreYOLO9
-    directly — it keeps the smoke test decoupled from yolo9 internals and
-    avoids having to instantiate a full detection model just to grab features.
-    Real weight porting from Tencent/YOLO-World would replace this with their
-    YOLOv8-L backbone + RepVL-PAN neck.
+
+class MaxSigmoidAttnBlock(nn.Module):
+    """Per-scale text-visual fusion: max-over-class sigmoid gating.
+
+    Given image feature `x` [B, C, H, W] and text embeddings
+    `guide` [B, N_cls, D_txt], compute a [B, H, W] per-pixel attention
+    (max over classes, per head, softmax-free), sigmoid it, and gate the
+    projected visual features.
+
+    Implementation matches `MaxSigmoidAttnBlock` from
+    yolo_world/models/layers/yolo_bricks.py.
     """
 
-    def __init__(self, embed_dim: int = EMBED_DIM, width: int = 64):
+    def __init__(self, in_channels: int, out_channels: int, guide_channels: int,
+                 embed_channels: int, num_heads: int = 8):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, width, 3, stride=2, padding=1),
-            nn.BatchNorm2d(width),
-            nn.SiLU(inplace=True),
-        )
-        self.stage1 = self._block(width, width * 2, stride=2)
-        self.stage2 = self._block(width * 2, width * 4, stride=2)
-        self.stage3 = self._block(width * 4, width * 8, stride=2)
-        self.neck = nn.Conv2d(width * 8, embed_dim, 1)
+        if embed_channels % num_heads != 0:
+            raise ValueError(f"embed_channels ({embed_channels}) must be divisible by num_heads ({num_heads})")
+        if out_channels % num_heads != 0:
+            raise ValueError(f"out_channels ({out_channels}) must be divisible by num_heads ({num_heads})")
+        self.num_heads = num_heads
+        self.attn_head_channels = embed_channels // num_heads   # Ch for attention dot-product
+        self.proj_head_channels = out_channels // num_heads     # Ch for output projection
 
-    @staticmethod
-    def _block(cin: int, cout: int, stride: int) -> nn.Sequential:
-        return nn.Sequential(
-            nn.Conv2d(cin, cout, 3, stride=stride, padding=1),
-            nn.BatchNorm2d(cout),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(cout, cout, 3, padding=1),
-            nn.BatchNorm2d(cout),
-            nn.SiLU(inplace=True),
+        self.embed_conv = (
+            ConvModule(in_channels, embed_channels, k=1, act=False)
+            if in_channels != embed_channels else nn.Identity()
+        )
+        self.guide_fc = nn.Linear(guide_channels, embed_channels)
+        self.bias = nn.Parameter(torch.zeros(num_heads))
+        self.project_conv = ConvModule(in_channels, out_channels, k=3)
+
+    def forward(self, x: torch.Tensor, guide: torch.Tensor) -> torch.Tensor:
+        B, _, H, W = x.shape
+        N = guide.shape[1]
+        M = self.num_heads
+
+        # Text embeddings projected and reshaped to (B, N, M, attn_Ch)
+        g = self.guide_fc(guide).view(B, N, M, self.attn_head_channels)
+
+        # Image embeddings for attention: (B, M, attn_Ch, H, W)
+        e = self.embed_conv(x).view(B, M, self.attn_head_channels, H, W)
+
+        # Attention scores: einsum -> (B, M, H, W, N)
+        attn = torch.einsum("bmchw,bnmc->bmhwn", e, g)
+        attn = attn.max(dim=-1)[0]  # max over classes -> (B, M, H, W)
+        attn = attn / math.sqrt(self.attn_head_channels)
+        attn = (attn + self.bias.view(1, M, 1, 1)).sigmoid()
+
+        # Image features for output, gated per-head
+        out = self.project_conv(x).view(B, M, self.proj_head_channels, H, W)
+        out = out * attn.unsqueeze(2)
+        return out.view(B, -1, H, W)
+
+
+class MaxSigmoidCSPLayerWithTwoConv(nn.Module):
+    """C2f block with an extra MaxSigmoidAttnBlock fusion branch (RepVL-PAN)."""
+
+    def __init__(self, in_channels: int, out_channels: int, guide_channels: int,
+                 embed_channels: int, num_heads: int, n: int = 1, shortcut: bool = False,
+                 e: float = 0.5):
+        super().__init__()
+        self.mid = int(out_channels * e)
+        self.main_conv = ConvModule(in_channels, 2 * self.mid, 1, 1)
+        self.blocks = nn.ModuleList(
+            DarknetBottleneck(self.mid, self.mid, shortcut=shortcut, e=1.0, k=(3, 3))
+            for _ in range(n)
+        )
+        # +1 branch: the attn-gated stream. Concat = 2 (split) + n (blocks) + 1 (attn)
+        self.attn_block = MaxSigmoidAttnBlock(
+            in_channels=self.mid, out_channels=self.mid,
+            guide_channels=guide_channels, embed_channels=embed_channels,
+            num_heads=num_heads,
+        )
+        self.final_conv = ConvModule((3 + n) * self.mid, out_channels, 1, 1)
+
+    def forward(self, x: torch.Tensor, guide: torch.Tensor) -> torch.Tensor:
+        y = self.main_conv(x)
+        y1, y2 = y.split(self.mid, dim=1)
+        outs = [y1, y2]
+        for blk in self.blocks:
+            outs.append(blk(outs[-1]))
+        # Attn branch consumes the last block's output
+        outs.append(self.attn_block(outs[-1], guide))
+        return self.final_conv(torch.cat(outs, dim=1))
+
+
+# ---------------------------------------------------------------------------
+# Neck — YOLO-World PAFPN with MaxSigmoid fusion at each merge.
+# ---------------------------------------------------------------------------
+
+
+class YOLOWorldPAFPN(nn.Module):
+    """PAFPN (top-down + bottom-up) with text-visual fusion via RepVL-PAN blocks."""
+
+    # Per-level channel counts defaults from V2.1 L config
+    DEFAULT_EMBED = (128, 256, 256)
+    DEFAULT_HEADS = (4, 8, 8)
+
+    def __init__(self, in_channels: Tuple[int, int, int], out_channels: Tuple[int, int, int],
+                 guide_channels: int = CLIP_EMBED_DIM,
+                 embed_channels: Sequence[int] = DEFAULT_EMBED,
+                 num_heads: Sequence[int] = DEFAULT_HEADS,
+                 n_blocks: int = 3):
+        super().__init__()
+        c3, c4, c5 = in_channels
+        o3, o4, o5 = out_channels
+
+        # Top-down path: P5 -> P4 -> P3
+        self.top_down_layer_1 = MaxSigmoidCSPLayerWithTwoConv(
+            in_channels=c5 + c4, out_channels=o4,
+            guide_channels=guide_channels,
+            embed_channels=embed_channels[1], num_heads=num_heads[1],
+            n=n_blocks,
+        )
+        self.top_down_layer_2 = MaxSigmoidCSPLayerWithTwoConv(
+            in_channels=o4 + c3, out_channels=o3,
+            guide_channels=guide_channels,
+            embed_channels=embed_channels[0], num_heads=num_heads[0],
+            n=n_blocks,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return (B, EMBED_DIM, H/16, W/16) feature map."""
-        x = self.stem(x)
-        x = self.stage1(x)
-        x = self.stage2(x)
-        x = self.stage3(x)
-        x = self.neck(x)
-        return x
+        # Bottom-up path
+        self.downsample_1 = ConvModule(o3, o3, k=3, s=2)
+        self.bottom_up_layer_1 = MaxSigmoidCSPLayerWithTwoConv(
+            in_channels=o3 + o4, out_channels=o4,
+            guide_channels=guide_channels,
+            embed_channels=embed_channels[1], num_heads=num_heads[1],
+            n=n_blocks,
+        )
+        self.downsample_2 = ConvModule(o4, o4, k=3, s=2)
+        self.bottom_up_layer_2 = MaxSigmoidCSPLayerWithTwoConv(
+            in_channels=o4 + c5, out_channels=o5,
+            guide_channels=guide_channels,
+            embed_channels=embed_channels[2], num_heads=num_heads[2],
+            n=n_blocks,
+        )
+
+    def forward(self, feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                text_embeds: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        p3, p4, p5 = feats
+
+        # Top-down
+        p5_up = F.interpolate(p5, scale_factor=2.0, mode="nearest")
+        m4 = self.top_down_layer_1(torch.cat([p5_up, p4], dim=1), text_embeds)
+        m4_up = F.interpolate(m4, scale_factor=2.0, mode="nearest")
+        m3 = self.top_down_layer_2(torch.cat([m4_up, p3], dim=1), text_embeds)
+
+        # Bottom-up
+        m3_d = self.downsample_1(m3)
+        m4_out = self.bottom_up_layer_1(torch.cat([m3_d, m4], dim=1), text_embeds)
+        m4_d = self.downsample_2(m4_out)
+        m5_out = self.bottom_up_layer_2(torch.cat([m4_d, p5], dim=1), text_embeds)
+
+        return m3, m4_out, m5_out
+
+
+# ---------------------------------------------------------------------------
+# Head — YOLOv8 reg head + BNContrastiveHead classifier.
+# ---------------------------------------------------------------------------
+
+
+class BNContrastiveHead(nn.Module):
+    """YOLO-World's BNContrastiveHead: BN over image-side embed, L2 norm text side.
+
+    cls_logit = (BN(cls_embed) · L2Norm(text_embeds)) * exp(logit_scale) + bias
+    """
+
+    def __init__(self, embed_dim: int = CLIP_EMBED_DIM):
+        super().__init__()
+        self.norm = nn.BatchNorm2d(embed_dim)
+        self.logit_scale = nn.Parameter(torch.tensor(2.6593))  # exp -> ~14.3
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, cls_embed: torch.Tensor, text_embeds: torch.Tensor) -> torch.Tensor:
+        """
+        cls_embed: (B, embed_dim, H, W)
+        text_embeds: (B, N_cls, embed_dim)   L2-normalized
+        returns: (B, N_cls, H, W) logits
+        """
+        x = self.norm(cls_embed)  # (B, D, H, W)
+        # Einsum over D to get per-class logit at each spatial location
+        logits = torch.einsum("bdhw,bnd->bnhw", x, text_embeds)
+        return logits * self.logit_scale.exp() + self.bias
+
+
+class YOLOWorldHeadModule(nn.Module):
+    """Three-scale detection head. Regression via DFL; classification via contrastive."""
+
+    def __init__(self, in_channels: Tuple[int, int, int], embed_dim: int = CLIP_EMBED_DIM,
+                 reg_max: int = 16):
+        super().__init__()
+        self.reg_max = reg_max
+        self.num_levels = 3
+
+        # Per-scale regression branches (2 Conv3x3 -> 1x1 -> 4*reg_max)
+        self.reg_preds = nn.ModuleList()
+        # Per-scale classification branches (2 Conv3x3 -> 1x1 -> embed_dim)
+        self.cls_preds = nn.ModuleList()
+        self.cls_contrasts = nn.ModuleList()
+
+        for c in in_channels:
+            c_reg = max(16, max(c // 4, 4 * reg_max))
+            c_cls = max(c, embed_dim)
+            self.reg_preds.append(nn.Sequential(
+                ConvModule(c, c_reg, k=3),
+                ConvModule(c_reg, c_reg, k=3),
+                nn.Conv2d(c_reg, 4 * reg_max, kernel_size=1),
+            ))
+            self.cls_preds.append(nn.Sequential(
+                ConvModule(c, c_cls, k=3),
+                ConvModule(c_cls, c_cls, k=3),
+                nn.Conv2d(c_cls, embed_dim, kernel_size=1),
+            ))
+            self.cls_contrasts.append(BNContrastiveHead(embed_dim))
+
+    def forward(self, feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                text_embeds: torch.Tensor):
+        bbox_dists = []
+        cls_logits = []
+        for i, f in enumerate(feats):
+            bbox_dists.append(self.reg_preds[i](f))       # (B, 4*reg_max, H, W)
+            emb = self.cls_preds[i](f)                    # (B, embed_dim, H, W)
+            logits = self.cls_contrasts[i](emb, text_embeds)  # (B, N_cls, H, W)
+            cls_logits.append(logits)
+        return bbox_dists, cls_logits
+
+
+# ---------------------------------------------------------------------------
+# Full model
+# ---------------------------------------------------------------------------
 
 
 class LibreYOLOWorldModel(nn.Module):
-    """Open-vocabulary detection core.
+    """Open-vocabulary YOLO detector: YOLOv8 backbone + CLIP text + RepVL-PAN + BNContrastive head.
 
-    Combines:
-      - A vision encoder producing spatial features at the EMBED_DIM space.
-      - A CLIP text encoder producing normalized text embeddings.
-      - A bbox head (4 regression outputs per anchor) + objectness.
-
-    At inference, similarity between spatial feature vectors and text
-    embeddings yields per-location, per-prompt class logits.
+    Structure follows YOLO-World-V2.1 so `weight_porting.py` can remap Tencent
+    state_dicts directly into this module.
     """
 
-    def __init__(
-        self,
-        *,
-        imgsz: int = 640,
-        embed_dim: int = EMBED_DIM,
-        width: int = 64,
-        num_anchors: int = 3,
-    ):
+    def __init__(self, size: str = "l", imgsz: int = 640, reg_max: int = 16):
         super().__init__()
+        self.size = size
         self.imgsz = imgsz
-        self.embed_dim = embed_dim
-        self.num_anchors = num_anchors
+        self.reg_max = reg_max
 
-        self.vision_encoder = VisionEncoder(embed_dim=embed_dim, width=width)
-        self.text_encoder = TextEncoder(embed_dim=embed_dim)
+        self.backbone = YOLOv8CSPDarknet(size=size)
+        self.text_encoder = TextEncoder(embed_dim=CLIP_EMBED_DIM)
 
-        # Bbox regression: (B, 4 * num_anchors, H, W) per stride.
-        self.bbox_head = nn.Conv2d(embed_dim, 4 * num_anchors, kernel_size=1)
-        # Objectness: (B, num_anchors, H, W) — does a box exist here?
-        self.obj_head = nn.Conv2d(embed_dim, num_anchors, kernel_size=1)
-        # Visual projection into text-aligned space: (B, embed_dim * num_anchors, H, W)
-        self.visual_proj = nn.Conv2d(embed_dim, embed_dim * num_anchors, kernel_size=1)
+        # Neck in/out channels = backbone's P3/P4/P5.
+        self.neck = YOLOWorldPAFPN(
+            in_channels=self.backbone.out_channels,
+            out_channels=self.backbone.out_channels,
+            guide_channels=CLIP_EMBED_DIM,
+        )
 
-        # Temperature for similarity logits (CLIP convention).
-        self.logit_scale = nn.Parameter(torch.ones([]) * 2.6593)  # exp ~ 14.3
+        self.head = YOLOWorldHeadModule(
+            in_channels=self.backbone.out_channels,
+            embed_dim=CLIP_EMBED_DIM,
+            reg_max=reg_max,
+        )
 
-        # Cached text embeddings — set by `set_prompts()`.
-        self.register_buffer("_text_embeds", torch.zeros(0, embed_dim), persistent=False)
+        # Strides at each scale (YOLOv8 default: 8, 16, 32)
+        self.register_buffer("strides", torch.tensor([8.0, 16.0, 32.0]), persistent=False)
+
+        # Cached prompts
+        self.register_buffer("_text_embeds", torch.zeros(0, CLIP_EMBED_DIM), persistent=False)
         self._current_prompts: List[str] = []
 
     # ------------------------------------------------------------------
-    # Public API
+    # Prompt API
     # ------------------------------------------------------------------
 
-    def set_prompts(self, prompts: List[str]) -> None:
-        """Encode and cache text embeddings for the given class names.
-
-        After this call, `forward(images)` returns class logits of shape
-        (B, num_anchors, H, W, len(prompts)) scored against these prompts.
-        """
+    def set_prompts(self, prompts: Sequence[str]) -> None:
         if not isinstance(prompts, (list, tuple)) or not all(isinstance(p, str) for p in prompts):
             raise ValueError("prompts must be a list of strings")
         if len(prompts) == 0:
@@ -189,43 +532,21 @@ class LibreYOLOWorldModel(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, images: torch.Tensor) -> dict:
-        """Forward pass.
-
-        Args:
-            images: (B, 3, H, W) float tensor in [0, 1].
-
-        Returns:
-            dict with:
-              - 'bbox': (B, num_anchors, H', W', 4) bbox regression (raw logits).
-              - 'obj':  (B, num_anchors, H', W') objectness logits.
-              - 'cls':  (B, num_anchors, H', W', num_prompts) per-prompt class logits.
-              - 'stride': scalar effective stride (imgsz / spatial size).
-        """
         if self._text_embeds.shape[0] == 0:
-            raise RuntimeError(
-                "No text prompts set. Call model.set_prompts([...]) before forward()."
-            )
+            raise RuntimeError("No text prompts set. Call model.set_prompts([...]) first.")
+        B = images.shape[0]
 
-        feat = self.vision_encoder(images)  # (B, C, H', W')
-        B, _, Hp, Wp = feat.shape
-        A = self.num_anchors
-        C = self.embed_dim
-        T = self._text_embeds.shape[0]
+        feats = self.backbone(images)  # (P3, P4, P5)
 
-        bbox = self.bbox_head(feat)              # (B, 4*A, H', W')
-        obj = self.obj_head(feat)                # (B,   A, H', W')
-        vis = self.visual_proj(feat)             # (B, C*A, H', W')
+        # Broadcast text to batch: (N, D) -> (B, N, D)
+        text = self._text_embeds.unsqueeze(0).expand(B, -1, -1).contiguous()
 
-        bbox = bbox.view(B, A, 4, Hp, Wp).permute(0, 1, 3, 4, 2).contiguous()  # (B,A,H,W,4)
-        obj = obj.view(B, A, Hp, Wp)
+        neck_feats = self.neck(feats, text)
+        bbox_dists, cls_logits = self.head(neck_feats, text)
 
-        # Visual features per anchor: (B, A, C, H, W) → (B, A, H, W, C)
-        vis = vis.view(B, A, C, Hp, Wp).permute(0, 1, 3, 4, 2).contiguous()
-        vis_n = F.normalize(vis, dim=-1)  # unit vectors on the C axis
-
-        # Similarity: (B, A, H, W, C) @ (T, C)^T → (B, A, H, W, T)
-        cls = torch.einsum("bahwc,tc->bahwt", vis_n, self._text_embeds)
-        cls = cls * self.logit_scale.exp()
-
-        stride = self.imgsz / Hp
-        return {"bbox": bbox, "obj": obj, "cls": cls, "stride": stride}
+        return {
+            "bbox_dists": bbox_dists,   # list of 3 tensors (B, 4*reg_max, H, W)
+            "cls_logits": cls_logits,   # list of 3 tensors (B, N_cls, H, W)
+            "strides": self.strides.tolist(),
+            "feature_shapes": [tuple(f.shape[-2:]) for f in neck_feats],
+        }
