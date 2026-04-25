@@ -1,0 +1,39 @@
+{
+  "frames_processed": 171,
+  "total_tracked_detections": 4306,
+  "unique_tracks": 183,
+  "mean_dets_per_frame": 25.18,
+  "tracks_lasting_>=30_frames": 51,
+  "track_lifetime_frames": {
+    "mean": 25.6,
+    "median": 7,
+    "max": 168,
+    "p90": 86.0
+  },
+  "mean_track_fragmentation_ratio": 0.0602,
+  "mean_box_area_cv": 0.188,
+  "mean_detection_confidence": 0.515,
+  "median_detection_confidence": 0.545,
+  "top_5_classes_by_count": [
+    [
+      0,
+      4250
+    ],
+    [
+      37,
+      16
+    ],
+    [
+      30,
+      14
+    ],
+    [
+      33,
+      11
+    ],
+    [
+      25,
+      6
+    ]
+  ]
+}
