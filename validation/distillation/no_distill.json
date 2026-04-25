@@ -1,0 +1,15 @@
+{
+  "label": "baseline",
+  "distillation": false,
+  "elapsed_seconds": 8.1,
+  "epochs": 1,
+  "batch": 4,
+  "imgsz": 320,
+  "lr0": 0.001,
+  "final_loss": 6.456504613161087,
+  "best_mAP50": 0.0,
+  "best_mAP50_95": 0.0,
+  "best_epoch": 0,
+  "best_checkpoint": "runs/distill_baseline/weights/best.pt",
+  "save_dir": "runs/distill_baseline"
+}
