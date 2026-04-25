@@ -291,7 +291,12 @@ class MaxSigmoidAttnBlock(nn.Module):
 
 
 class MaxSigmoidCSPLayerWithTwoConv(nn.Module):
-    """C2f block with an extra MaxSigmoidAttnBlock fusion branch (RepVL-PAN)."""
+    """C2f block with text-visual fusion via MaxSigmoidAttnBlock (RepVL-PAN).
+
+    The attn_block is applied **in-place on the last block's output** (it
+    replaces the last block's output in the concat list, not adds a new
+    stream). This matches upstream's `(2 + n) * mid` final_conv input shape.
+    """
 
     def __init__(self, in_channels: int, out_channels: int, guide_channels: int,
                  embed_channels: int, num_heads: int, n: int = 1, shortcut: bool = False,
@@ -303,13 +308,12 @@ class MaxSigmoidCSPLayerWithTwoConv(nn.Module):
             DarknetBottleneck(self.mid, self.mid, shortcut=shortcut, e=1.0, k=(3, 3))
             for _ in range(n)
         )
-        # +1 branch: the attn-gated stream. Concat = 2 (split) + n (blocks) + 1 (attn)
         self.attn_block = MaxSigmoidAttnBlock(
             in_channels=self.mid, out_channels=self.mid,
             guide_channels=guide_channels, embed_channels=embed_channels,
             num_heads=num_heads,
         )
-        self.final_conv = ConvModule((3 + n) * self.mid, out_channels, 1, 1)
+        self.final_conv = ConvModule((2 + n) * self.mid, out_channels, 1, 1)
 
     def forward(self, x: torch.Tensor, guide: torch.Tensor) -> torch.Tensor:
         y = self.main_conv(x)
@@ -317,8 +321,8 @@ class MaxSigmoidCSPLayerWithTwoConv(nn.Module):
         outs = [y1, y2]
         for blk in self.blocks:
             outs.append(blk(outs[-1]))
-        # Attn branch consumes the last block's output
-        outs.append(self.attn_block(outs[-1], guide))
+        # Attn applied IN-PLACE on the last block output (replaces, not appends)
+        outs[-1] = self.attn_block(outs[-1], guide)
         return self.final_conv(torch.cat(outs, dim=1))
 
 
@@ -330,18 +334,28 @@ class MaxSigmoidCSPLayerWithTwoConv(nn.Module):
 class YOLOWorldPAFPN(nn.Module):
     """PAFPN (top-down + bottom-up) with text-visual fusion via RepVL-PAN blocks."""
 
-    # Per-level channel counts defaults from V2.1 L config
-    DEFAULT_EMBED = (128, 256, 256)
-    DEFAULT_HEADS = (4, 8, 8)
+    # YOLO-World-V2.1 neck conventions (verified against the S checkpoint):
+    #   - n_blocks=2 across all 4 neck CSP layers (size-independent)
+    #   - num_heads = mid_channels // 32 per scale (so heads grow with channels)
+    #   - embed_channels = mid_channels (=out_channels // 2)
+    #   - num_heads is per-scale (P3, P4, P5) since deeper layers have wider features
+    DEFAULT_N_BLOCKS = 2
 
     def __init__(self, in_channels: Tuple[int, int, int], out_channels: Tuple[int, int, int],
                  guide_channels: int = CLIP_EMBED_DIM,
-                 embed_channels: Sequence[int] = DEFAULT_EMBED,
-                 num_heads: Sequence[int] = DEFAULT_HEADS,
-                 n_blocks: int = 3):
+                 embed_channels: Optional[Sequence[int]] = None,
+                 num_heads: Optional[Sequence[int]] = None,
+                 n_blocks: int = DEFAULT_N_BLOCKS):
         super().__init__()
         c3, c4, c5 = in_channels
         o3, o4, o5 = out_channels
+
+        # Default embed_channels = mid (out_channels // 2). Matches the V2.1 conv shapes.
+        if embed_channels is None:
+            embed_channels = (o3 // 2, o4 // 2, o5 // 2)
+        # Default num_heads = mid // 32 (V2.1 rule: each head sees 32 channels).
+        if num_heads is None:
+            num_heads = tuple(max(1, ec // 32) for ec in embed_channels)
 
         # Top-down path: P5 -> P4 -> P3
         self.top_down_layer_1 = MaxSigmoidCSPLayerWithTwoConv(
@@ -407,8 +421,9 @@ class BNContrastiveHead(nn.Module):
     def __init__(self, embed_dim: int = CLIP_EMBED_DIM):
         super().__init__()
         self.norm = nn.BatchNorm2d(embed_dim)
+        # Both bias and logit_scale are scalars (shape ()) to match V2.1 checkpoints.
         self.logit_scale = nn.Parameter(torch.tensor(2.6593))  # exp -> ~14.3
-        self.bias = nn.Parameter(torch.zeros(1))
+        self.bias = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, cls_embed: torch.Tensor, text_embeds: torch.Tensor) -> torch.Tensor:
         """
@@ -416,8 +431,7 @@ class BNContrastiveHead(nn.Module):
         text_embeds: (B, N_cls, embed_dim)   L2-normalized
         returns: (B, N_cls, H, W) logits
         """
-        x = self.norm(cls_embed)  # (B, D, H, W)
-        # Einsum over D to get per-class logit at each spatial location
+        x = self.norm(cls_embed)
         logits = torch.einsum("bdhw,bnd->bnhw", x, text_embeds)
         return logits * self.logit_scale.exp() + self.bias
 
@@ -431,15 +445,17 @@ class YOLOWorldHeadModule(nn.Module):
         self.reg_max = reg_max
         self.num_levels = 3
 
-        # Per-scale regression branches (2 Conv3x3 -> 1x1 -> 4*reg_max)
+        # V2.1 head conventions:
+        #   reg intermediate channels = 4 * reg_max  (= 64 for reg_max=16)
+        #   cls intermediate channels = embed_dim // 4  (= 128 for embed_dim=512)
+        c_reg = 4 * reg_max
+        c_cls = embed_dim // 4
+
         self.reg_preds = nn.ModuleList()
-        # Per-scale classification branches (2 Conv3x3 -> 1x1 -> embed_dim)
         self.cls_preds = nn.ModuleList()
         self.cls_contrasts = nn.ModuleList()
 
         for c in in_channels:
-            c_reg = max(16, max(c // 4, 4 * reg_max))
-            c_cls = max(c, embed_dim)
             self.reg_preds.append(nn.Sequential(
                 ConvModule(c, c_reg, k=3),
                 ConvModule(c_reg, c_reg, k=3),
