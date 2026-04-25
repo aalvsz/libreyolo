@@ -1,0 +1,112 @@
+{
+  "model": "wondervictor/YOLO-World-V2.1 / s_stage2",
+  "weight_load": {
+    "loaded_keys": 411,
+    "shape_mismatches": 0
+  },
+  "results": [
+    {
+      "image": "street_cats.jpg",
+      "prompts": [
+        "cat",
+        "remote control",
+        "couch",
+        "blanket"
+      ],
+      "num_detections": 0,
+      "detections": [],
+      "annotated": "validation/yoloworld/outputs/street_cats.detected.jpg"
+    },
+    {
+      "image": "kitchen.jpg",
+      "prompts": [
+        "chair",
+        "dining table",
+        "bottle",
+        "cup",
+        "wine glass",
+        "bowl"
+      ],
+      "num_detections": 0,
+      "detections": [],
+      "annotated": "validation/yoloworld/outputs/kitchen.detected.jpg"
+    },
+    {
+      "image": "snowboard.jpg",
+      "prompts": [
+        "person",
+        "snowboard",
+        "skis",
+        "tree"
+      ],
+      "num_detections": 1,
+      "detections": [
+        {
+          "cls": 0,
+          "label": "person",
+          "conf": 0.2191,
+          "xyxy": [
+            0.0,
+            437.3,
+            184.7,
+            500.0
+          ]
+        }
+      ],
+      "annotated": "validation/yoloworld/outputs/snowboard.detected.jpg"
+    },
+    {
+      "image": "surfer.jpg",
+      "prompts": [
+        "person",
+        "surfboard",
+        "wave",
+        "ocean"
+      ],
+      "num_detections": 0,
+      "detections": [],
+      "annotated": "validation/yoloworld/outputs/surfer.detected.jpg"
+    },
+    {
+      "image": "skateboard.jpg",
+      "prompts": [
+        "person",
+        "skateboard",
+        "ground",
+        "shadow"
+      ],
+      "num_detections": 0,
+      "detections": [],
+      "annotated": "validation/yoloworld/outputs/skateboard.detected.jpg"
+    },
+    {
+      "image": "dining.jpg",
+      "prompts": [
+        "person",
+        "wine glass",
+        "dining table",
+        "bowl",
+        "fork",
+        "knife",
+        "cup"
+      ],
+      "num_detections": 0,
+      "detections": [],
+      "annotated": "validation/yoloworld/outputs/dining.detected.jpg"
+    },
+    {
+      "image": "traffic.jpg",
+      "prompts": [
+        "car",
+        "truck",
+        "bus",
+        "person",
+        "traffic light",
+        "stop sign"
+      ],
+      "num_detections": 0,
+      "detections": [],
+      "annotated": "validation/yoloworld/outputs/traffic.detected.jpg"
+    }
+  ]
+}

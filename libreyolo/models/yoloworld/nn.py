@@ -221,12 +221,21 @@ class TextEncoder(nn.Module):
         self.proj = nn.Identity() if proj_dim == embed_dim else nn.Linear(proj_dim, embed_dim, bias=False)
 
     @torch.no_grad()
-    def encode(self, prompts: Sequence[str], device: Optional[torch.device] = None) -> torch.Tensor:
+    def encode(self, prompts: Sequence[str], device: Optional[torch.device] = None,
+               template: str = "{}") -> torch.Tensor:
+        """Encode a list of class-name strings into L2-normalized embeddings.
+
+        `template` wraps each prompt — V2.1 was trained without a template
+        ('cat' rather than 'a photo of a cat'), so default is a no-op.
+        Templates like 'a photo of a {}' can help when CLIP is used directly,
+        but hurt accuracy with V2.1 weights since they distribution-shift the
+        text embeddings away from training.
+        """
         if device is None:
             device = next(self.text_model.parameters()).device
-        tokens = self.tokenizer(list(prompts), padding=True, return_tensors="pt").to(device)
+        wrapped = [template.format(p) for p in prompts]
+        tokens = self.tokenizer(wrapped, padding=True, return_tensors="pt").to(device)
         out = self.text_model(**tokens)
-        # CLIPTextModelWithProjection returns a ModelOutput with .text_embeds (already projected).
         x = self.proj(out.text_embeds)
         return F.normalize(x, dim=-1)
 
@@ -293,9 +302,9 @@ class MaxSigmoidAttnBlock(nn.Module):
 class MaxSigmoidCSPLayerWithTwoConv(nn.Module):
     """C2f block with text-visual fusion via MaxSigmoidAttnBlock (RepVL-PAN).
 
-    The attn_block is applied **in-place on the last block's output** (it
-    replaces the last block's output in the concat list, not adds a new
-    stream). This matches upstream's `(2 + n) * mid` final_conv input shape.
+    The attn_block output is **appended** to the concat list as a separate
+    stream (not applied in-place). Final_conv input width = `(3 + n) * mid`.
+    Verified against V2.1-S: n=1, mid=128, final_conv input = 4*128 = 512.
     """
 
     def __init__(self, in_channels: int, out_channels: int, guide_channels: int,
@@ -313,7 +322,8 @@ class MaxSigmoidCSPLayerWithTwoConv(nn.Module):
             guide_channels=guide_channels, embed_channels=embed_channels,
             num_heads=num_heads,
         )
-        self.final_conv = ConvModule((2 + n) * self.mid, out_channels, 1, 1)
+        # 2 (split) + n (block outputs) + 1 (attn-on-last-block) = 3 + n streams
+        self.final_conv = ConvModule((3 + n) * self.mid, out_channels, 1, 1)
 
     def forward(self, x: torch.Tensor, guide: torch.Tensor) -> torch.Tensor:
         y = self.main_conv(x)
@@ -321,8 +331,7 @@ class MaxSigmoidCSPLayerWithTwoConv(nn.Module):
         outs = [y1, y2]
         for blk in self.blocks:
             outs.append(blk(outs[-1]))
-        # Attn applied IN-PLACE on the last block output (replaces, not appends)
-        outs[-1] = self.attn_block(outs[-1], guide)
+        outs.append(self.attn_block(outs[-1], guide))
         return self.final_conv(torch.cat(outs, dim=1))
 
 
@@ -339,7 +348,7 @@ class YOLOWorldPAFPN(nn.Module):
     #   - num_heads = mid_channels // 32 per scale (so heads grow with channels)
     #   - embed_channels = mid_channels (=out_channels // 2)
     #   - num_heads is per-scale (P3, P4, P5) since deeper layers have wider features
-    DEFAULT_N_BLOCKS = 2
+    DEFAULT_N_BLOCKS = 1  # V2.1 standard (verified against S checkpoint)
 
     def __init__(self, in_channels: Tuple[int, int, int], out_channels: Tuple[int, int, int],
                  guide_channels: int = CLIP_EMBED_DIM,
@@ -428,11 +437,16 @@ class BNContrastiveHead(nn.Module):
     def forward(self, cls_embed: torch.Tensor, text_embeds: torch.Tensor) -> torch.Tensor:
         """
         cls_embed: (B, embed_dim, H, W)
-        text_embeds: (B, N_cls, embed_dim)   L2-normalized
+        text_embeds: (B, N_cls, embed_dim)   L2-normalized along channel dim
         returns: (B, N_cls, H, W) logits
         """
+        # V2.1 BN-contrast: BN on image embed (NOT additionally L2-normalized),
+        # L2-normalized text. The very negative learned bias (~-10) cancels the
+        # large dot-product magnitude (~sqrt(C) * sigma) so the post-sigmoid
+        # confidences are calibrated.
         x = self.norm(cls_embed)
-        logits = torch.einsum("bdhw,bnd->bnhw", x, text_embeds)
+        text = F.normalize(text_embeds, dim=-1, p=2)
+        logits = torch.einsum("bdhw,bnd->bnhw", x, text)
         return logits * self.logit_scale.exp() + self.bias
 
 

@@ -143,6 +143,8 @@ class LibreYOLOWorld(BaseModel):
         return _preprocess_numpy
 
     def _preprocess(self, image, color_format: str = "auto", input_size: Optional[int] = None):
+        """Letterbox to (size, size), preserving aspect ratio. Records letterbox
+        params on `self._last_letterbox` so postprocess can undo them."""
         from PIL import Image
         import numpy as np
 
@@ -152,13 +154,33 @@ class LibreYOLOWorld(BaseModel):
             image = Image.fromarray(image)
         assert isinstance(image, Image.Image)
         size = self._imgsz if input_size is None else input_size
-        img = image.resize((size, size))
-        arr = np.asarray(img).astype("float32") / 255.0
+
+        ow, oh = image.size
+        # Letterbox: scale by min ratio so the longer side fills `size`.
+        ratio = min(size / oh, size / ow)
+        new_w, new_h = int(round(ow * ratio)), int(round(oh * ratio))
+        resized = image.resize((new_w, new_h))
+
+        # Pad with grey (114) to (size, size). Pad evenly around the image.
+        pad_x = (size - new_w) // 2
+        pad_y = (size - new_h) // 2
+        canvas = Image.new("RGB", (size, size), (114, 114, 114))
+        canvas.paste(resized, (pad_x, pad_y))
+
+        arr = np.asarray(canvas).astype("float32") / 255.0
         tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        return tensor, image, image.size, 1.0
+
+        # Stash letterbox params for postprocess unwarping
+        self._last_letterbox = {"ratio": ratio, "pad_x": pad_x, "pad_y": pad_y}
+        return tensor, image, image.size, ratio
 
     def _forward(self, input_tensor: torch.Tensor):
-        return self.model(input_tensor)
+        # Critical: BatchNorm in BNContrastiveHead and throughout the model
+        # MUST be in eval mode at inference. With batch=1, training-mode BN
+        # would compute per-sample stats and silently destroy detections.
+        self.model.eval()
+        with torch.no_grad():
+            return self.model(input_tensor)
 
     def _postprocess(
         self,
@@ -235,13 +257,20 @@ class LibreYOLOWorld(BaseModel):
         conf_t = conf_t[keep]
         cls_t = cls_t[keep]
 
-        # Rescale from imgsz coords to original image size
-        ow, oh = original_size
-        scale_x = ow / self._imgsz
-        scale_y = oh / self._imgsz
+        # Undo letterbox: subtract pad, divide by ratio. Falls back to plain
+        # resize-rescale if _last_letterbox isn't set (programmatic forward).
+        lb = getattr(self, "_last_letterbox", None)
         boxes_t = boxes_t.clone()
-        boxes_t[:, [0, 2]] *= scale_x
-        boxes_t[:, [1, 3]] *= scale_y
+        if lb is not None:
+            boxes_t[:, [0, 2]] = (boxes_t[:, [0, 2]] - lb["pad_x"]) / lb["ratio"]
+            boxes_t[:, [1, 3]] = (boxes_t[:, [1, 3]] - lb["pad_y"]) / lb["ratio"]
+            ow, oh = original_size
+            boxes_t[:, [0, 2]] = boxes_t[:, [0, 2]].clamp(0, ow)
+            boxes_t[:, [1, 3]] = boxes_t[:, [1, 3]].clamp(0, oh)
+        else:
+            ow, oh = original_size
+            boxes_t[:, [0, 2]] *= ow / self._imgsz
+            boxes_t[:, [1, 3]] *= oh / self._imgsz
 
         return {
             "boxes": boxes_t.detach().cpu().float(),
